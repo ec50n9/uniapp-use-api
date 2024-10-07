@@ -1,8 +1,9 @@
 mod prompt_util;
-use actix_web::{get, post, web, App, HttpResponse, HttpServer, Responder};
-use prompt_util::generate_response;
+use actix_web::{get, post, web, App, Error, HttpResponse, HttpServer, Responder};
+use futures_util::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 const OPENAI_BASE_URL: &str = "https://api.deepseek.com";
 const OPENAI_API_KEY: &str = "sk-0d5ac1a4720e4ae48c1f0885c7824f40";
@@ -13,10 +14,6 @@ const TEACHER_PROMPT: &str = include_str!("openai_prompts/english.txt");
 #[derive(Debug, Deserialize)]
 struct OpenAiRequest {
     text: String,
-    analysis: Option<bool>,
-    corrections: Option<bool>,
-    learning_diagnosis: Option<bool>,
-    advancement_suggestions: Option<bool>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -44,16 +41,11 @@ struct Message {
 }
 
 #[post("/openai")]
-async fn openai(req: web::Json<OpenAiRequest>) -> impl Responder {
+async fn openai(req: web::Json<OpenAiRequest>) -> Result<HttpResponse, Error> {
     let client = Client::new();
     let url = format!("{}/v1/chat/completions", OPENAI_BASE_URL);
 
-    let prompt = generate_response(
-        req.analysis.unwrap_or(false),
-        req.corrections.unwrap_or(false),
-        req.learning_diagnosis.unwrap_or(false),
-        req.advancement_suggestions.unwrap_or(false),
-    );
+    let prompt = TEACHER_PROMPT;
 
     let request_body = serde_json::json!({
         "model": &OPENAI_MODEL,
@@ -61,44 +53,51 @@ async fn openai(req: web::Json<OpenAiRequest>) -> impl Responder {
             {"role": "system","content": prompt},
             {"role": "user","content": format!("Please analyze the following sentence: [{}]", req.0.text)}
         ],
-        "stream": false,
+        "stream": true,
     });
 
     let response = client
         .post(&url)
         .header("Authorization", format!("Bearer {}", OPENAI_API_KEY))
+        .header("Content-Type", "application/json")
         .json(&request_body)
         .send()
-        .await;
+        .await
+        .map_err(actix_web::error::ErrorInternalServerError)?;
 
-    let response = match response {
-        Ok(res) => res,
-        Err(err) => return HttpResponse::InternalServerError().body(err.to_string()),
-    };
+    let stream = response.bytes_stream().map(|chunk| {
+        chunk
+            .map_err(|err| actix_web::error::ErrorInternalServerError(err))
+            .and_then(|data| {
+                if let Ok(text) = String::from_utf8(data.to_vec()) {
+                    let processed = text
+                        .split('\n')
+                        .filter(|line| line.starts_with("data: "))
+                        .map(|line| line[6..].to_string())
+                        .collect::<String>();
 
-    let response_body = match response.json::<OpenAiResponse>().await {
-        Ok(body) => body,
-        Err(err) => return HttpResponse::InternalServerError().json(
-            serde_json::json!({ "error": "Failed to parse response", "detail": err.to_string() }),
-        ),
-    };
+                    if processed == "[DONE]" {
+                        return Ok::<web::Bytes, actix_web::error::Error>(web::Bytes::from("\n"));
+                    }
 
-    if let Some(error) = response_body.error {
-        return HttpResponse::InternalServerError()
-            .json(serde_json::json!({"error": "OpenAI error", "detail": error}));
-    }
+                    // Parse the JSON response
+                    if let Ok(json) = serde_json::from_str::<Value>(&processed) {
+                        if let Some(content) = json["choices"][0]["delta"]["content"].as_str() {
+                            if !content.eq("```") && !content.eq("json") {
+                                return Ok::<web::Bytes, actix_web::error::Error>(
+                                    web::Bytes::from(content.to_string()),
+                                );
+                            }
+                        }
+                    }
+                }
+                Ok::<web::Bytes, actix_web::error::Error>(web::Bytes::new())
+            })
+    });
 
-    let content = response_body
-        .choices
-        .first()
-        .unwrap()
-        .message
-        .content
-        .clone();
-
-    println!("content: {:?}", content);
-
-    HttpResponse::Ok().json(serde_json::json!({ "content": content }))
+    Ok(HttpResponse::Ok()
+        .content_type("text/event-stream")
+        .streaming(stream))
 }
 
 #[get("/")]
